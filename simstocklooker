@@ -1,0 +1,470 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from datetime import date, timedelta, datetime
+
+st.set_page_config(page_title="Mini TradingView-like Tracker", layout="wide")
+
+st.title("Mini TradingView-like Stock Tracker")
+st.markdown("Choose tickers to chart, add transactions (buys/sells), and see P/L per-stock and for the combined portfolio.")
+
+# -------------------------
+# Utilities & session init
+# -------------------------
+if "transactions" not in st.session_state:
+    # Each transaction: dict with id, date (datetime.date), ticker (str), shares (float), price (float), amount (float), note (str)
+    st.session_state.transactions = []
+
+def add_transaction(tx):
+    tx["id"] = len(st.session_state.transactions) + 1
+    st.session_state.transactions.append(tx)
+
+def remove_transaction(tx_id):
+    st.session_state.transactions = [t for t in st.session_state.transactions if t["id"] != tx_id]
+
+@st.cache_data(ttl=60*30)
+def fetch_history(tickers, start_dt, end_dt):
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    # use yfinance.download for efficiency when multiple tickers
+    try:
+        df = yf.download(tickers=tickers, start=start_dt, end=end_dt, group_by="ticker", auto_adjust=False, threads=True)
+        return df
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
+        return None
+
+def parse_date(x):
+    if isinstance(x, datetime):
+        return x.date()
+    if isinstance(x, pd.Timestamp):
+        return x.date()
+    return x
+
+# -------------------------
+# Sidebar: tickers & fetch
+# -------------------------
+with st.sidebar:
+    st.header("Chart & Transactions")
+    tickers_input = st.text_input("Tickers (comma-separated)", value="AAPL, MSFT")
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    today = date.today()
+    default_start = today - timedelta(days=365)
+    start_date = st.date_input("Chart start date", value=default_start)
+    end_date = st.date_input("Chart end date (exclusive)", value=today + timedelta(days=1))
+    st.markdown("---")
+    st.subheader("Add transaction (buy/sell)")
+    with st.form("tx_form", clear_on_submit=True):
+        tx_ticker = st.selectbox("Ticker", options=tickers if tickers else ["AAPL"])
+        tx_date = st.date_input("Date", value=today - timedelta(days=30), key="tx_date")
+        tx_type = st.selectbox("Type", options=["Buy", "Sell"])
+        # Provide two mutually exclusive inputs: shares or total amount
+        col1, col2 = st.columns(2)
+        with col1:
+            tx_shares = st.number_input("Shares (can be fractional)", min_value=0.0, step=0.01, key="tx_shares", format="%.6f")
+        with col2:
+            tx_amount = st.number_input("Total amount (USD) — optional", min_value=0.0, step=0.01, key="tx_amount", format="%.2f")
+        tx_price = st.number_input("Price per share (optional — if empty, price from market data used)", min_value=0.0, step=0.01, key="tx_price", format="%.4f")
+        tx_note = st.text_input("Note (optional)")
+        submitted = st.form_submit_button("Add transaction")
+        if submitted:
+            if tx_shares <= 0 and tx_amount <= 0 and tx_price <= 0:
+                st.warning("Enter shares or an amount or a price (to compute shares).")
+            else:
+                # Determine shares and amount and sign for sells
+                sign = -1.0 if tx_type == "Sell" else 1.0
+                shares = tx_shares
+                price = tx_price if tx_price > 0 else None
+                amount = tx_amount if tx_amount > 0 else None
+
+                tx_date_parsed = parse_date(tx_date)
+                tx_obj = {
+                    "date": tx_date_parsed,
+                    "ticker": tx_ticker,
+                    "shares": 0.0,
+                    "price": None,
+                    "amount": None,
+                    "note": tx_note
+                }
+
+                # If amount given and price not given -> compute shares from market close on that day later
+                if shares > 0:
+                    tx_obj["shares"] = sign * shares
+                    if price:
+                        tx_obj["price"] = price
+                        tx_obj["amount"] = abs(shares * price)
+                    else:
+                        tx_obj["price"] = None
+                        tx_obj["amount"] = None
+                elif amount and price:
+                    computed_shares = amount / price
+                    tx_obj["shares"] = sign * computed_shares
+                    tx_obj["price"] = price
+                    tx_obj["amount"] = amount
+                elif amount and not price:
+                    # price to be filled later from market data
+                    tx_obj["shares"] = sign * (amount)  # placeholder; we'll compute true shares later by dividing by price_from_market
+                    tx_obj["price"] = None
+                    tx_obj["amount"] = amount
+                elif price and not (shares or amount):
+                    st.error("Price provided but no shares or amount — cannot create transaction.")
+                else:
+                    st.error("Unsupported transaction input combination.")
+                add_transaction(tx_obj)
+                st.success("Transaction added to session.")
+
+    st.markdown("---")
+    st.markdown("Transactions stored in this session only. Use the controls in the main area to remove or export them.")
+
+# -------------------------
+# Main area: show transactions
+# -------------------------
+st.subheader("Transactions (session)")
+if st.session_state.transactions:
+    tx_df = pd.DataFrame(st.session_state.transactions)
+    # display nicer
+    display_df = tx_df.copy()
+    display_df["date"] = display_df["date"].astype(str)
+    display_df = display_df[["id", "date", "ticker", "shares", "price", "amount", "note"]]
+    st.dataframe(display_df, use_container_width=True)
+    # controls to remove
+    colR1, colR2 = st.columns([1, 3])
+    with colR1:
+        remove_id = st.number_input("Remove transaction ID", min_value=1, value=st.session_state.transactions[-1]["id"], step=1)
+        if st.button("Remove"):
+            remove_transaction(int(remove_id))
+            st.experimental_rerun()
+    with colR2:
+        st.download_button("Download transactions CSV", pd.DataFrame(st.session_state.transactions).to_csv(index=False).encode("utf-8"), "transactions.csv", "text/csv")
+else:
+    st.info("No transactions yet. Add transactions in the sidebar.")
+
+st.markdown("---")
+
+# -------------------------
+# Fetch data and compute
+# -------------------------
+if not tickers:
+    st.warning("Enter one or more tickers in the sidebar to start.")
+    st.stop()
+
+# Determine global start date: min of user start_date and earliest transaction
+min_tx_date = None
+if st.session_state.transactions:
+    min_tx_date = min(t["date"] for t in st.session_state.transactions)
+global_start = min(start_date, min_tx_date) if min_tx_date else start_date
+# yfinance end must be at least global_start + 1 day
+end_dt = end_date
+
+with st.spinner("Fetching market data..."):
+    raw = fetch_history(tickers, global_start, end_dt)
+    if raw is None or raw.empty:
+        st.error("Could not fetch market data. Check tickers or try again later.")
+        st.stop()
+
+# Normalize returned structure: if single ticker, yfinance returns DataFrame; if multiple, returns multiindex by ticker
+price_data = {}
+if len(tickers) == 1:
+    # raw has columns like Open, High, Low, Close, Adj Close, Volume
+    df = raw.copy()
+    price_data[tickers[0]] = df
+else:
+    # raw is a multi-column DF, group by ticker
+    for t in tickers:
+        try:
+            df_t = raw[t].copy()
+            # If df_t is empty, try download by single ticker
+            if df_t.empty:
+                df_single = yf.download(t, start=global_start, end=end_dt, auto_adjust=False)
+                price_data[t] = df_single
+            else:
+                price_data[t] = df_t
+        except Exception:
+            # fallback to single download
+            df_single = yf.download(t, start=global_start, end=end_dt, auto_adjust=False)
+            price_data[t] = df_single
+
+# Fill missing 'Close' columns if needed (some tickers may have 'Adj Close')
+for t, df in price_data.items():
+    if df is None or df.empty:
+        st.warning(f"No data for {t}.")
+        price_data[t] = pd.DataFrame()
+    else:
+        if "Close" not in df.columns and "Adj Close" in df.columns:
+            df["Close"] = df["Adj Close"]
+        price_data[t] = df.dropna(subset=["Close"], how="all")
+
+# -------------------------
+# Resolve transactions that lacked price/shares
+# -------------------------
+resolved_tx = []
+for tx in st.session_state.transactions:
+    tx_copy = tx.copy()
+    t = tx_copy["ticker"]
+    date_key = tx_copy["date"]
+    # if price is None but amount provided: use close price on that date
+    if (tx_copy.get("price") is None) and (tx_copy.get("amount") is not None):
+        df = price_data.get(t)
+        if df is None or df.empty:
+            st.warning(f"Missing market data to resolve transaction for {t} on {date_key}")
+            continue
+        # find the nearest available date on or after the tx date, else before
+        try:
+            # convert to Timestamp for indexing
+            date_idx = pd.Timestamp(date_key)
+            if date_idx in df.index:
+                close_price = float(df.loc[date_idx, "Close"])
+            else:
+                # find next available index after date, else previous
+                future = df.loc[df.index >= date_idx]
+                if not future.empty:
+                    close_price = float(future["Close"].iloc[0])
+                else:
+                    past = df.loc[df.index <= date_idx]
+                    if not past.empty:
+                        close_price = float(past["Close"].iloc[-1])
+                    else:
+                        st.warning(f"No price to resolve transaction for {t} on {date_key}")
+                        continue
+            tx_copy["price"] = close_price
+            # compute shares from amount
+            if tx_copy["amount"] is not None:
+                shares = tx_copy["amount"] / close_price
+                # If original shares was placeholder (we used amount as placeholder), set correct shares
+                tx_copy["shares"] = (np.sign(tx_copy["shares"]) if tx_copy["shares"] != 0 else 1.0) * shares
+        except Exception as e:
+            st.warning(f"Error resolving tx: {e}")
+    # if shares non-zero but price is None: fill price from market on date
+    if (tx_copy.get("price") is None) and (tx_copy.get("shares", 0) != 0):
+        df = price_data.get(t)
+        if df is None or df.empty:
+            st.warning(f"Missing market data to resolve transaction for {t} on {date_key}")
+            continue
+        try:
+            date_idx = pd.Timestamp(date_key)
+            if date_idx in df.index:
+                close_price = float(df.loc[date_idx, "Close"])
+            else:
+                future = df.loc[df.index >= date_idx]
+                if not future.empty:
+                    close_price = float(future["Close"].iloc[0])
+                else:
+                    past = df.loc[df.index <= date_idx]
+                    if not past.empty:
+                        close_price = float(past["Close"].iloc[-1])
+                    else:
+                        st.warning(f"No price to resolve transaction for {t} on {date_key}")
+                        continue
+            tx_copy["price"] = close_price
+            tx_copy["amount"] = abs(tx_copy["shares"]) * close_price
+        except Exception as e:
+            st.warning(f"Error resolving tx: {e}")
+    resolved_tx.append(tx_copy)
+
+# Use resolved transactions for calculations
+tx_df = pd.DataFrame(resolved_tx)
+if tx_df.empty:
+    st.info("No resolvable transactions yet (they may lack price/amount and there is no market data). Add a transaction or adjust chart start date.")
+# -------------------------
+# Build per-ticker holdings over time
+# -------------------------
+# Create a date index from global_start to today
+all_dates = pd.date_range(start=global_start, end=end_dt, closed="left", freq="D")
+portfolio_values = pd.Series(0.0, index=all_dates)
+
+# Prepare per-ticker summaries
+summaries = []
+
+for t in tickers:
+    df = price_data.get(t)
+    if df is None or df.empty:
+        continue
+    # create daily close series aligned to all_dates (forward/backfill to fill market holidays)
+    closes = df["Close"].reindex(all_dates).ffill().bfill()
+    # sum shares up to each date from transactions
+    tx_for_t = tx_df[tx_df["ticker"] == t] if not tx_df.empty else pd.DataFrame()
+    # series for cumulative shares over time
+    shares_series = pd.Series(0.0, index=all_dates)
+    if not tx_for_t.empty:
+        # build a delta series of shares that occur on tx date
+        share_deltas = {}
+        for _, row in tx_for_t.iterrows():
+            tx_date = pd.Timestamp(row["date"])
+            # find the nearest index in all_dates >= tx_date
+            idxs = all_dates[all_dates.get_indexer_for([tx_date]) >= 0] if False else None
+            # simpler: if tx_date in all_dates use it, else find next day index >= tx_date or previous
+            if tx_date in all_dates:
+                eff_date = tx_date
+            else:
+                future = all_dates[all_dates >= tx_date]
+                eff_date = future[0] if len(future) > 0 else all_dates[-1]
+            share_deltas.setdefault(eff_date, 0.0)
+            share_deltas[eff_date] += float(row["shares"])
+        # apply deltas cumulatively
+        running = 0.0
+        for dt in all_dates:
+            if dt in share_deltas:
+                running += share_deltas[dt]
+            shares_series.loc[dt] = running
+    # position value series
+    value_series = shares_series * closes
+    portfolio_values = portfolio_values.add(value_series, fill_value=0.0)
+    # compute invested amount (sum of buys amount - sells)
+    invested = 0.0
+    if not tx_for_t.empty:
+        # buys add invested, sells subtract invested (we keep invested positive for buys)
+        for _, row in tx_for_t.iterrows():
+            amt = row.get("amount")
+            if amt is None:
+                # compute as shares * price if price exists
+                if row.get("price") is not None and row.get("shares") is not None:
+                    amt = abs(row["shares"]) * row["price"]
+                else:
+                    amt = 0.0
+            invested += amt if row.get("shares", 0) > 0 else -amt
+    # current value is last available value in value_series
+    try:
+        current_value = float(value_series.dropna().iloc[-1])
+    except Exception:
+        current_value = 0.0
+    profit = current_value - invested
+    profit_pct = (profit / invested * 100.0) if invested != 0 else (np.nan if current_value != 0 else 0.0)
+    summaries.append({
+        "ticker": t,
+        "invested": invested,
+        "current_value": current_value,
+        "profit": profit,
+        "profit_pct": profit_pct,
+        "shares_held": float(shares_series.iloc[-1])
+    })
+
+# -------------------------
+# Charts: Candles and Portfolio Value
+# -------------------------
+st.subheader("Charts")
+
+chart_col1, chart_col2 = st.columns([3, 2])
+
+with chart_col1:
+    # Combined candlestick chart: allow selection of ticker to show candles for and overlays of buy points from transactions
+    selected_chart_ticker = st.selectbox("Ticker to view candles", options=[s["ticker"] for s in summaries] if summaries else tickers)
+    df_chart = price_data.get(selected_chart_ticker)
+    if df_chart is None or df_chart.empty:
+        st.warning(f"No market data to chart for {selected_chart_ticker}")
+    else:
+        # build candlestick trace
+        # Trim df_chart to the chart start/end range
+        df_chart_trim = df_chart.loc[(df_chart.index >= pd.Timestamp(global_start)) & (df_chart.index < pd.Timestamp(end_dt))]
+        # Plotly candlestick
+        fig = go.Figure(data=[go.Candlestick(
+            x=df_chart_trim.index,
+            open=df_chart_trim["Open"],
+            high=df_chart_trim["High"],
+            low=df_chart_trim["Low"],
+            close=df_chart_trim["Close"],
+            name=selected_chart_ticker
+        )])
+        # Add buy/sell markers
+        tx_for_chart = pd.DataFrame(resolved_tx)
+        if not tx_for_chart.empty:
+            tx_for_chart = tx_for_chart[tx_for_chart["ticker"] == selected_chart_ticker]
+            for _, row in tx_for_chart.iterrows():
+                # find price to place marker (use row.price)
+                tx_dt = pd.Timestamp(row["date"])
+                if tx_dt in df_chart_trim.index:
+                    px = float(df_chart_trim.loc[tx_dt, "Close"])
+                else:
+                    # find nearest
+                    future = df_chart_trim.loc[df_chart_trim.index >= tx_dt]
+                    if not future.empty:
+                        px = float(future["Close"].iloc[0])
+                        tx_dt = future.index[0]
+                    else:
+                        past = df_chart_trim.loc[df_chart_trim.index <= tx_dt]
+                        if not past.empty:
+                            px = float(past["Close"].iloc[-1])
+                            tx_dt = past.index[-1]
+                        else:
+                            continue
+                marker_color = "green" if row["shares"] > 0 else "red"
+                marker_symbol = "triangle-up" if row["shares"] > 0 else "triangle-down"
+                fig.add_trace(go.Scatter(
+                    x=[tx_dt], y=[px],
+                    mode="markers+text",
+                    marker=dict(symbol=marker_symbol, color=marker_color, size=12),
+                    text=[f'{("Buy" if row["shares"]>0 else "Sell")} {abs(row["shares"]):.4f}'],
+                    textposition="top center",
+                    showlegend=False
+                ))
+
+        fig.update_layout(height=600, margin=dict(l=40, r=20, t=40, b=40), xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+with chart_col2:
+    st.write("Portfolio breakdown & summary")
+    if summaries:
+        sum_df = pd.DataFrame(summaries).set_index("ticker")
+        sum_df_display = sum_df.copy()
+        sum_df_display["invested"] = sum_df_display["invested"].map("${:,.2f}".format)
+        sum_df_display["current_value"] = sum_df_display["current_value"].map("${:,.2f}".format)
+        sum_df_display["profit"] = sum_df_display["profit"].map("${:,.2f}".format)
+        sum_df_display["profit_pct"] = sum_df_display["profit_pct"].map(lambda x: f"{x:.2f}%" if not pd.isna(x) else "—")
+        st.table(sum_df_display)
+    else:
+        st.info("No summarized holdings yet.")
+
+# Portfolio value over time (line chart)
+st.subheader("Portfolio value over time (combined)")
+pv_df = portfolio_values.fillna(0.0)
+fig2 = go.Figure()
+fig2.add_trace(go.Scatter(x=pv_df.index, y=pv_df.values, mode="lines", name="Portfolio Value"))
+# plot total invested line (cumulative invested)
+total_invested = 0.0
+if not tx_df.empty:
+    # compute invested over time: sum of transaction amounts (buys positive, sells negative) at their effective date
+    invested_series = pd.Series(0.0, index=all_dates)
+    for _, row in tx_df.iterrows():
+        eff_date = pd.Timestamp(row["date"])
+        # find index in all_dates >= eff_date
+        if eff_date in invested_series.index:
+            idx = eff_date
+        else:
+            future = invested_series.index[invested_series.index >= eff_date]
+            idx = future[0] if len(future) > 0 else invested_series.index[-1]
+        amt = row.get("amount")
+        if amt is None:
+            if row.get("price") is not None and row.get("shares") is not None:
+                amt = abs(row["shares"]) * row["price"]
+            else:
+                amt = 0.0
+        sign = 1.0 if row["shares"] > 0 else -1.0
+        invested_series.loc[idx] += sign * amt
+    # cumulative invested
+    invested_cum = invested_series.cumsum()
+    fig2.add_trace(go.Scatter(x=invested_cum.index, y=invested_cum.values, mode="lines", name="Cumulative Invested", line=dict(dash="dash")))
+    total_invested = float(invested_cum.iloc[-1]) if not invested_cum.empty else 0.0
+
+fig2.update_layout(height=420, margin=dict(l=40, r=20, t=20, b=20))
+st.plotly_chart(fig2, use_container_width=True)
+
+# Summary KPIs
+st.markdown("---")
+st.subheader("Overall portfolio summary")
+total_current = float(pv_df.iloc[-1]) if not pv_df.empty else 0.0
+total_profit = total_current - total_invested
+total_profit_pct = (total_profit / total_invested * 100.0) if total_invested != 0 else (np.nan if total_current != 0 else 0.0)
+col1, col2, col3 = st.columns(3)
+col1.metric("Total Invested (USD)", f"${total_invested:,.2f}")
+col2.metric("Current Value (USD)", f"${total_current:,.2f}", delta=f"${total_profit:,.2f}")
+col3.metric("Total P/L (%)", f"{(total_profit_pct if not pd.isna(total_profit_pct) else 0.0):.2f}%")
+
+# CSV download: portfolio values over time
+out_df = pd.DataFrame({
+    "date": pv_df.index,
+    "portfolio_value": pv_df.values,
+})
+st.download_button("Download portfolio values CSV", out_df.to_csv(index=False).encode("utf-8"), "portfolio_values.csv", "text/csv")
+
+st.markdown("If you want TradingView-style indicators (RSI, moving averages) or multiple-chart layouts, tell me which indicators and layout and I can add them.")
