@@ -1,0 +1,272 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import date, timedelta, datetime
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+st.set_page_config(page_title="Multi-Stock Price & Gains Tracker", layout="wide")
+st.title("Multi-Stock Price & Gains Tracker")
+st.markdown("Enter tickers, provide a buy date and either shares / amount / buy price for each ticker. The app will show price, percent gains since buy, and combined portfolio P/L.")
+
+# Initialize session storage for per-ticker buy-settings (one buy per ticker for simplicity)
+if "buys" not in st.session_state:
+    st.session_state.buys = {}  # key = ticker -> dict with buy_date (date), shares (float or None), amount (float or None), buy_price (float or None)
+
+# Sidebar: tickers input and global date range
+with st.sidebar:
+    st.header("Tickers & global settings")
+    tickers_input = st.text_input("Tickers (comma-separated)", value="AAPL, MSFT, TSLA")
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    today = date.today()
+    default_start = today - timedelta(days=180)
+    global_start = st.date_input("Chart start date", value=default_start)
+    st.markdown("Per-ticker buy info is below. For each ticker supply a buy date and either shares, amount, or buy price (any missing values will be filled from market close on the buy date).")
+    st.markdown("---")
+    if st.button("Clear all buys"):
+        st.session_state.buys = {}
+        st.experimental_rerun()
+
+# Per-ticker buy inputs
+for t in tickers:
+    exp = st.expander(f"Buy info for {t}", expanded=False)
+    with exp:
+        existing = st.session_state.buys.get(t, {})
+        bdate = st.date_input(f"Buy date ({t})", value=existing.get("buy_date", today - timedelta(days=30)), key=f"buydate_{t}")
+        shares = st.number_input(f"Shares (can be fractional) ({t})", min_value=0.0, value=float(existing.get("shares") or 0.0), step=0.01, format="%.6f", key=f"shares_{t}")
+        amount = st.number_input(f"Total amount invested (USD) ({t}) — optional", min_value=0.0, value=float(existing.get("amount") or 0.0), step=0.01, format="%.2f", key=f"amount_{t}")
+        buy_price = st.number_input(f"Buy price per share (USD) ({t}) — optional", min_value=0.0, value=float(existing.get("buy_price") or 0.0), step=0.0001, format="%.4f", key=f"price_{t}")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button(f"Save buy for {t}", key=f"save_{t}"):
+                buy_info = {
+                    "buy_date": bdate,
+                    "shares": float(shares) if shares > 0 else None,
+                    "amount": float(amount) if amount > 0 else None,
+                    "buy_price": float(buy_price) if buy_price > 0 else None,
+                }
+                st.session_state.buys[t] = buy_info
+                st.success(f"Saved buy for {t}")
+        with col2:
+            if st.button(f"Remove buy for {t}", key=f"remove_{t}"):
+                if t in st.session_state.buys:
+                    del st.session_state.buys[t]
+                    st.success(f"Removed buy for {t}")
+                else:
+                    st.info("No saved buy to remove.")
+
+st.markdown("---")
+
+if not tickers:
+    st.info("Enter at least one ticker to start.")
+    st.stop()
+
+# Determine fetch start: earliest of global_start and any buy dates
+min_buy_date = None
+if st.session_state.buys:
+    buy_dates = [v["buy_date"] for v in st.session_state.buys.values() if v.get("buy_date")]
+    if buy_dates:
+        min_buy_date = min(buy_dates)
+fetch_start = min(global_start, min_buy_date) if min_buy_date else global_start
+fetch_end = today + timedelta(days=1)  # yfinance end is exclusive; include today
+
+@st.cache_data(ttl=60*30)
+def download_history(tickers_list, start_dt, end_dt):
+    try:
+        df = yf.download(tickers=tickers_list, start=start_dt, end=end_dt, group_by="ticker", auto_adjust=False, threads=True)
+        return df
+    except Exception as e:
+        return None
+
+with st.spinner("Fetching market data..."):
+    raw = download_history(tickers, fetch_start, fetch_end)
+    if raw is None or raw.empty:
+        st.error("Could not fetch market data. Check tickers or try again later.")
+        st.stop()
+
+# Normalize price data per ticker
+price_data = {}
+for t in tickers:
+    try:
+        if len(tickers) == 1:
+            df_t = raw.copy()
+        else:
+            df_t = raw[t].copy()
+        # Ensure Close exists
+        if "Close" not in df_t.columns and "Adj Close" in df_t.columns:
+            df_t["Close"] = df_t["Adj Close"]
+        price_data[t] = df_t.dropna(subset=["Close"], how="all")
+    except Exception:
+        # Try single download fallback
+        df_single = yf.download(t, start=fetch_start, end=fetch_end, auto_adjust=False)
+        if "Close" not in df_single.columns and "Adj Close" in df_single.columns:
+            df_single["Close"] = df_single["Adj Close"]
+        price_data[t] = df_single.dropna(subset=["Close"], how="all")
+
+# Resolve buys: fill missing buy_price or shares using market close on the buy_date (or nearest available)
+resolved = {}
+for t in tickers:
+    buy = st.session_state.buys.get(t)
+    if not buy:
+        continue
+    df = price_data.get(t)
+    if df is None or df.empty:
+        st.warning(f"No market data for {t}; skipping buy resolution.")
+        continue
+    bdate = buy.get("buy_date")
+    # convert to Timestamp and find nearest available close on or after buy date, else previous
+    idx = pd.Timestamp(bdate)
+    if idx in df.index:
+        price_on_date = float(df.loc[idx, "Close"])
+    else:
+        future = df.loc[df.index >= idx]
+        if not future.empty:
+            price_on_date = float(future["Close"].iloc[0])
+            idx = future.index[0]
+        else:
+            past = df.loc[df.index <= idx]
+            if not past.empty:
+                price_on_date = float(past["Close"].iloc[-1])
+                idx = past.index[-1]
+            else:
+                st.warning(f"No price available to resolve buy for {t} on {bdate}.")
+                continue
+    buy_price = buy.get("buy_price") or price_on_date
+    shares = buy.get("shares")
+    amount = buy.get("amount")
+    # If shares not provided but amount provided -> compute shares
+    if (shares is None or shares == 0.0) and (amount is not None):
+        shares = amount / buy_price if buy_price != 0 else 0.0
+        amount = abs(shares * buy_price)
+    # If amount not provided but shares and buy_price exist -> compute amount
+    if (amount is None or amount == 0.0) and (shares is not None and buy_price is not None):
+        amount = abs(shares * buy_price)
+    resolved[t] = {
+        "buy_date": pd.Timestamp(idx).date(),
+        "buy_price": float(buy_price),
+        "shares": float(shares) if shares is not None else 0.0,
+        "amount": float(amount) if amount is not None else 0.0
+    }
+
+if not resolved:
+    st.info("No buys saved yet. Use the per-ticker panels to save buy info, then scroll down for charts.")
+    st.stop()
+
+# Build daily index from fetch_start to today (left-inclusive)
+date_index = pd.date_range(start=fetch_start, end=fetch_end - timedelta(days=1), freq="D")
+
+# Prepare dataframes to collect outputs
+value_df = pd.DataFrame(index=date_index)
+pct_df = pd.DataFrame(index=date_index)
+
+summaries = []
+
+for t, buy in resolved.items():
+    df = price_data.get(t)
+    if df is None or df.empty:
+        continue
+    # create close price series aligned to date_index
+    closes = df["Close"].reindex(date_index).ffill().bfill()
+    buy_price = buy["buy_price"]
+    shares = buy["shares"]
+    invested = buy["amount"]
+    # If shares is zero but invested>0 and buy_price>0, compute shares
+    if shares == 0.0 and invested and buy_price:
+        shares = invested / buy_price
+    # portfolio value series for this ticker
+    value_series = closes * shares
+    pct_series = (closes / buy_price - 1.0) * 100.0  # percent change versus buy price
+    value_df[t] = value_series
+    pct_df[t] = pct_series
+    current_value = float(value_series.dropna().iloc[-1]) if not value_series.dropna().empty else 0.0
+    profit = current_value - invested
+    profit_pct = (profit / invested * 100.0) if invested != 0 else (np.nan if current_value != 0 else 0.0)
+    summaries.append({
+        "ticker": t,
+        "buy_date": buy["buy_date"].isoformat(),
+        "buy_price": buy_price,
+        "shares": shares,
+        "invested": invested,
+        "current_value": current_value,
+        "profit": profit,
+        "profit_pct": profit_pct
+    })
+
+# Combined portfolio
+portfolio_values = value_df.sum(axis=1).fillna(0.0)
+total_invested = sum(s["invested"] for s in summaries)
+total_current = float(portfolio_values.iloc[-1]) if not portfolio_values.empty else 0.0
+total_profit = total_current - total_invested
+total_profit_pct = (total_profit / total_invested * 100.0) if total_invested != 0 else (np.nan if total_current != 0 else 0.0)
+
+# Display summaries
+st.subheader("Per-ticker summary")
+sum_df = pd.DataFrame(summaries).set_index("ticker")
+sum_df_display = sum_df.copy()
+sum_df_display["buy_price"] = sum_df_display["buy_price"].map("${:,.2f}".format)
+sum_df_display["invested"] = sum_df_display["invested"].map("${:,.2f}".format)
+sum_df_display["current_value"] = sum_df_display["current_value"].map("${:,.2f}".format)
+sum_df_display["profit"] = sum_df_display["profit"].map("${:,.2f}".format)
+sum_df_display["profit_pct"] = sum_df_display["profit_pct"].map(lambda x: f"{x:.2f}%" if not pd.isna(x) else "—")
+st.table(sum_df_display)
+
+# Charts
+st.subheader("Price chart (Close) for selected tickers")
+chart_tickers = st.multiselect("Tickers to show in price chart", options=list(resolved.keys()), default=list(resolved.keys()))
+if chart_tickers:
+    fig_price = go.Figure()
+    for t in chart_tickers:
+        fig_price.add_trace(go.Scatter(x=date_index, y=value_df[t]/(resolved[t]["shares"] if resolved[t]["shares"]!=0 else 1), mode="lines", name=f"{t} Close"))
+        # add marker at buy date
+        buy_dt = pd.Timestamp(resolved[t]["buy_date"])
+        buy_px = resolved[t]["buy_price"]
+        fig_price.add_trace(go.Scatter(x=[buy_dt], y=[buy_px], mode="markers+text", marker=dict(symbol="triangle-up", size=10), text=[f"Buy {resolved[t]['shares']:.4f}"], textposition="top center", showlegend=False))
+    fig_price.update_layout(yaxis_title="Price (USD)", height=480, xaxis_title="Date", legend_title="Ticker")
+    st.plotly_chart(fig_price, use_container_width=True)
+
+st.subheader("Percent gain since buy (per ticker)")
+chart_pct = st.multiselect("Tickers to show percent gain", options=list(resolved.keys()), default=list(resolved.keys()))
+if chart_pct:
+    fig_pct = go.Figure()
+    for t in chart_pct:
+        fig_pct.add_trace(go.Scatter(x=date_index, y=pct_df[t], mode="lines", name=f"{t} % since buy"))
+    fig_pct.update_layout(yaxis_title="Percent change (%)", height=360, xaxis_title="Date", legend_title="Ticker")
+    st.plotly_chart(fig_pct, use_container_width=True)
+
+st.subheader("Combined portfolio value")
+fig_port = make_subplots(rows=1, cols=1)
+fig_port.add_trace(go.Scatter(x=portfolio_values.index, y=portfolio_values.values, mode="lines", name="Portfolio Value"), row=1, col=1)
+# Add invested line (step)
+invested_series = pd.Series(0.0, index=date_index)
+for t, buy in resolved.items():
+    eff = pd.Timestamp(buy["buy_date"])
+    if eff in invested_series.index:
+        invested_series.loc[eff] += buy["amount"]
+    else:
+        future = invested_series.index[invested_series.index >= eff]
+        idx = future[0] if len(future) > 0 else invested_series.index[-1]
+        invested_series.loc[idx] += buy["amount"]
+invested_cum = invested_series.cumsum()
+fig_port.add_trace(go.Scatter(x=invested_cum.index, y=invested_cum.values, mode="lines", name="Cumulative Invested", line=dict(dash="dash")), row=1, col=1)
+fig_port.update_layout(yaxis_title="USD", height=420, xaxis_title="Date", legend_title="Series")
+st.plotly_chart(fig_port, use_container_width=True)
+
+# Portfolio KPIs
+st.markdown("---")
+st.subheader("Overall portfolio summary")
+col1, col2, col3 = st.columns(3)
+col1.metric("Total Invested (USD)", f"${total_invested:,.2f}")
+col2.metric("Current Value (USD)", f"${total_current:,.2f}", delta=f"${total_profit:,.2f}")
+col3.metric("Total P/L (%)", f"{(total_profit_pct if not pd.isna(total_profit_pct) else 0.0):.2f}%")
+
+# CSV download: per-date values and percent change
+out_df = pd.DataFrame(index=date_index)
+for t in resolved.keys():
+    out_df[f"{t}_price"] = (value_df[t] / (resolved[t]["shares"] if resolved[t]["shares"]!=0 else 1)).round(4)
+    out_df[f"{t}_value"] = value_df[t].round(4)
+    out_df[f"{t}_pct_since_buy"] = pct_df[t].round(4)
+out_df["portfolio_value"] = portfolio_values.round(4)
+st.download_button("Download CSV (prices, values, pct since buy)", out_df.reset_index().rename(columns={"index":"date"}).to_csv(index=False).encode("utf-8"), "multi_stock_portfolio.csv", "text/csv")
+
+st.markdown("If you'd like persistent storage, multiple buys per ticker, or TradingView-style indicators (moving averages, RSI) added to the charts, tell me which features to add and I'll extend this.")
