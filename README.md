@@ -1,23 +1,24 @@
 ```markdown
-# Simple Stock P/L Tracker (Streamlit)
+# Multi-Stock Price & Gains Tracker (Streamlit)
 
-What this does
-- Lets you enter a ticker, buy date, number of shares, and buy price.
-- Fetches historical prices (Yahoo via yfinance).
-- Shows current profit/loss (absolute and percent) since the buy date.
-- Plots portfolio value over time (from buy date to today).
+What this is
+- A simple Streamlit app that tracks price and gains (absolute and percent) over time for the stocks you choose.
+- For each ticker you can enter a buy date and either shares, total amount invested, or an explicit buy price.
+- The app fetches historical prices (yfinance), resolves buy price/shares if needed, and plots:
+  - Price chart (Close)
+  - Percent gain since the buy date for each ticker
+  - Combined portfolio value and overall P/L
 
 Requirements
 - Python 3.8+
 - Install dependencies:
-  pip install streamlit yfinance pandas matplotlib
+  pip install -r requirements.txt
 
 Run
-- In the folder with `stock_tracker.py`:
-  streamlit run stock_tracker.py
+- streamlit run multi_stock_tracker.py
 
 Notes
+- Transactions / buy settings are kept only for the current Streamlit session.
 - Uses yfinance (no API key). Yahoo may rate-limit heavy use.
-- Supports fractional shares.
-- If you want to track multiple entries or auto-refresh, we can extend it.
+- If you want multiple buys per ticker, advanced indicators, or persistent storage, I can add those next.
 ```
